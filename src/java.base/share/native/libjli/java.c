@@ -25,7 +25,7 @@
 
 /*
  * ===========================================================================
- * (c) Copyright IBM Corp. 2022, 2023 All Rights Reserved
+ * (c) Copyright IBM Corp. 2022, 2024 All Rights Reserved
  * ===========================================================================
  */
 
@@ -61,6 +61,11 @@
 
 #include "java.h"
 #include "jni.h"
+#include "j9cfg.h"
+#if defined(J9VM_OPT_CRAC_SUPPORT)
+#include <ctype.h>
+#include <sys/wait.h>
+#endif /* defined(J9VM_OPT_CRAC_SUPPORT) */
 
 /*
  * A NOTE TO DEVELOPERS: For performance reasons it is important that
@@ -72,6 +77,55 @@
 
 #define USE_STDERR JNI_TRUE     /* we usually print to stderr */
 #define USE_STDOUT JNI_FALSE
+#if defined(J9VM_OPT_CRAC_SUPPORT)
+/* The return codes indicating errors, successful execution, or specific conditions. */
+#define EXECVP_ERROR -1
+#define EXECVP_SUCCESS 0
+#define WAIT_INDEFINITELY 0
+#define MEMORY_ALLOCATION_ERROR 1
+#define OPTION_NAME_NOT_FOUND_ERROR 2
+#define OPTION_VALUE_NOT_FOUND_ERROR 3
+#define OPTION_VALUE_NOT_VALID_ERROR 4
+#define OPTION_VALUE_NOT_EXPECTED_ERROR 5
+#define CRIU_RESTORE_MIN_ARGS 6
+#define CRIU_RESTORE_MAX_ARGS 9
+
+/* The special characters. */
+#define EQUALS_SIGN '='
+#define NULL_TERMINATOR '\0'
+#define EMPTY_SPACE ' '
+
+/* The error messages. */
+#define OPTION_VALUE_NOT_FOUND_ERROR_MESSAGE "The value of the command line option %s was not found."
+#define OPTION_VALUE_NOT_VALID_ERROR_MESSAGE "The value of the command line option is not valid, option=%s, value=%s."
+#define OPTION_VALUE_NOT_EXPECTED_ERROR_MESSAGE "The value of the command line option is not expected, option=%s, value=%s."
+#define CHECKPOINT_DIRECTORY_ERROR_MESSAGE "Failed to get the CRIU checkpoint directory, error=%d."
+#define LOG_LEVEL_ERROR_MESSAGE "Failed to get the CRIU log level, error=%d."
+#define UNPRIVILEGED_MODE_ERROR_MESSAGE "Failed to get the CRIU unprivileged mode, error=%d."
+#define LOG_FILE_ERROR_MESSAGE "Failed to get the CRIU log file, error=%d."
+#define COMMAND_OPTION_LENGTH_CALCULATION_ERROR_MESSAGE "Failed to calculate the length of the command option, value=%s, format=%s."
+#define COMMAND_OPTION_MEMORY_ALLOCATION_ERROR_MESSAGE "Failed to allocate memory for the command option, value=%s, format=%s."
+#define RESTORE_FROM_CHECKPOINT_ERROR_MESSAGE "Failed to restore from checkpoint, error=%d."
+#define RESTORE_CHILD_PROCESS_FAILED_ERROR_MESSAGE "The CRIU restore child process failed."
+
+/* The option names. */
+#define CRAC_RESTORE_FROM_OPTION_NAME "-XX:CRaCRestoreFrom"
+#define LOG_LEVEL_OPTION_NAME "-Dopenj9.internal.criu.logLevel"
+#define UNPRIVILEGED_MODE_OPTION_NAME "-Dopenj9.internal.criu.unprivilegedMode"
+#define LOG_FILE_OPTION_NAME "-Dopenj9.internal.criu.logFile"
+
+/* The option formats. */
+#define LOG_LEVEL_OPTION_FORMAT "-v%d"
+#define LOG_FILE_OPTION_FORMAT "--log-file=%s"
+
+/* The CRIU command options. */
+#define CRIU_COMMAND "criu"
+#define CRIU_RESTORE_OPTION "restore"
+#define CRIU_CHECKPOINT_DIRECTORY_OPTION "-D"
+#define CRIU_DEFAULT_LOG_LEVEL_OPTION "-v2"
+#define CRIU_SHELL_JOB_OPTION "--shell-job"
+#define CRIU_UNPRIVILEGED_MODE_OPTION "--unprivileged"
+#endif /* defined(J9VM_OPT_CRAC_SUPPORT) */
 
 static jboolean printVersion = JNI_FALSE; /* print and exit */
 static jboolean showVersion = JNI_FALSE;  /* print but continue */
@@ -534,6 +588,391 @@ invokeInstanceMainWithoutArgs(JNIEnv *env, jclass mainClass) {
     return 1;
 }
 
+#if defined(J9VM_OPT_CRAC_SUPPORT)
+/**
+ * Get the value of a command line option in the array of command line arguments.
+ * @param[in] optionName The name of the command line option to search for
+ * @param[in] argc The number of command line arguments
+ * @param[in] argv The array of command line arguments
+ * @param[out] error A pointer to an integer for the error code
+ * @return A pointer to the value of the command line option if found, NULL otherwise
+ */
+static const char *
+getCommandLineOptionValue(const char *optionName, int argc, char **argv, int *error)
+{
+    const char *value = NULL;
+    int i = 0;
+    char *arg = NULL;
+    unsigned int optionNameLength = strlen(optionName);
+    char *equals = NULL;
+    jboolean optionNameFound = JNI_FALSE;
+    *error = 0;
+    for (; i < argc; i++) {
+        arg = argv[i];
+        if (0 == strncmp(arg, optionName, optionNameLength)) {
+            equals = arg + optionNameLength;
+            if ((EQUALS_SIGN == *equals) || (NULL_TERMINATOR == *equals)) {
+                optionNameFound = JNI_TRUE;
+                value = equals;
+                if (EQUALS_SIGN == *value) {
+                    value = value + 1;
+                }
+                if (NULL_TERMINATOR == *value) {
+                    value = NULL;
+                }
+                break;
+            }
+        }
+    }
+    if (!optionNameFound) {
+        *error = OPTION_NAME_NOT_FOUND_ERROR;
+    }
+    return value;
+}
+
+/**
+ * Check if an error occurred while retrieving a command line option value.
+ * @param[in] error The error code of the result of obtaining the command line option value
+ * @return true if an error occurred, false otherwise
+ */
+static jboolean
+hasGetCommandLineOptionValueFoundError(int error)
+{
+    return 0 != error;
+}
+
+/**
+ * Get the checkpoint directory from command line options.
+ * @param[in] argc The number of command line arguments
+ * @param[in] argv The array of command line arguments
+ * @param[in/out] error A pointer to an integer for the error code
+ * @return A pointer to the checkpoint directory if found, NULL otherwise
+ */
+static const char *
+getCheckpointDirectory(int argc, char **argv, int *error)
+{
+    const char *checkpointDirectory = NULL;
+    const char *checkpointDirectoryPropertyValue = getCommandLineOptionValue(CRAC_RESTORE_FROM_OPTION_NAME, argc, argv, error);
+    if (!hasGetCommandLineOptionValueFoundError(*error)) {
+        if (NULL != checkpointDirectoryPropertyValue) {
+            checkpointDirectory = checkpointDirectoryPropertyValue;
+        } else {
+            JLI_ReportErrorMessage(OPTION_VALUE_NOT_FOUND_ERROR_MESSAGE, CRAC_RESTORE_FROM_OPTION_NAME);
+            *error = OPTION_VALUE_NOT_FOUND_ERROR;
+        }
+    }
+    return checkpointDirectory;
+}
+
+/**
+ * Check if a command line option is found with an error condition.
+ * @param[in] error The error code of the result of obtaining the command line option
+ * @return true if the command line option is found and an error occurred, false otherwise
+ */
+static jboolean
+isCommandLineOptionFoundWithError(int error)
+{
+    return (OPTION_NAME_NOT_FOUND_ERROR != error) && hasGetCommandLineOptionValueFoundError(error);
+}
+
+/**
+ * Get the log level specified in the command line arguments.
+ * @param[in] argc The number of command line arguments
+ * @param[in] argv The array of command line arguments
+ * @param[in/out] error A pointer to an integer for the error code
+ * @return A pointer to the log level string if successful, NULL otherwise
+ */
+static const char *
+getLogLevel(int argc, char **argv, int *error)
+{
+    const char *logLevel = NULL;
+    const char *logLevelPropertyValue = NULL;
+    int logLevelValue = 0;
+    logLevelPropertyValue = getCommandLineOptionValue(LOG_LEVEL_OPTION_NAME, argc, argv, error);
+    if (!isCommandLineOptionFoundWithError(*error)) {
+        if (NULL != logLevelPropertyValue) {
+            for (const char *c = logLevelPropertyValue; NULL_TERMINATOR != *c; c++) {
+                if (!isdigit(*c)) {
+                    goto setLogLevelOptionValueNotValidError;
+                }
+            }
+            logLevelValue = atoi(logLevelPropertyValue);
+            if ((logLevelValue >= 0) && (logLevelValue <= 4)) {
+                logLevel = logLevelPropertyValue;
+                goto returnGetLogLevel;
+            } else {
+                goto setLogLevelOptionValueNotValidError;
+            }
+        } else {
+            goto returnGetLogLevel;
+        }
+    }
+setLogLevelOptionValueNotValidError:
+    JLI_ReportErrorMessage(OPTION_VALUE_NOT_VALID_ERROR_MESSAGE, LOG_LEVEL_OPTION_NAME, logLevelPropertyValue);
+    *error = OPTION_VALUE_NOT_VALID_ERROR;
+returnGetLogLevel:
+    return logLevel;
+}
+
+/**
+ * Check if the unprivileged mode is specified in the command line arguments.
+ * @param[in] argc The number of command line arguments
+ * @param[in] argv The array of command line arguments
+ * @param[in/out] error A pointer to an integer for the error code
+ * @return true if the unprivileged mode option is specified in the command line arguments, false otherwise
+ */
+static jboolean
+isUnprivilegedModeOn(int argc, char **argv, int *error)
+{
+    jboolean isUnprivilegedModeOn = JNI_FALSE;
+    const char *unprivilegedModePropertyValue = NULL;
+    unprivilegedModePropertyValue = getCommandLineOptionValue(UNPRIVILEGED_MODE_OPTION_NAME, argc, argv, error);
+    if (!hasGetCommandLineOptionValueFoundError(*error)) {
+            if (NULL == unprivilegedModePropertyValue) {
+                isUnprivilegedModeOn = JNI_TRUE;
+            } else {
+                JLI_ReportErrorMessage(OPTION_VALUE_NOT_EXPECTED_ERROR_MESSAGE, UNPRIVILEGED_MODE_OPTION_NAME, unprivilegedModePropertyValue);
+                *error = OPTION_VALUE_NOT_EXPECTED_ERROR;
+            }
+    }
+    return isUnprivilegedModeOn;
+}
+
+/**
+ * Get the log file specified in the command line arguments.
+ * @param[in] argc The number of command line arguments
+ * @param[in] argv The array of command line arguments
+ * @param[in/out] error A pointer to an integer for the error code
+ * @return A pointer to the log file string if successful, NULL otherwise
+ */
+static const char *
+getLogFile(int argc, char **argv, int *error)
+{
+    const char *logFile = NULL;
+    const char *logFilePropertyValue = NULL;
+    logFilePropertyValue = getCommandLineOptionValue(LOG_FILE_OPTION_NAME, argc, argv, error);
+    if (!hasGetCommandLineOptionValueFoundError(*error)) {
+        if (NULL != logFilePropertyValue) {
+            logFile = logFilePropertyValue;
+        } else {
+            JLI_ReportErrorMessage(OPTION_VALUE_NOT_FOUND_ERROR_MESSAGE, LOG_FILE_OPTION_NAME);
+            *error = OPTION_VALUE_NOT_FOUND_ERROR;
+        }
+    }
+    return logFile;
+}
+
+/**
+ * Calculate the length of the formatted string.
+ * @param[in] format The format string
+ * @param[in] value The value to include in the format string
+ * @return THe length of the formatted string, -1 otherwise
+ */
+static int
+calculateFormattedStringLength(const char *format, const char *value)
+{
+    int length = -1;
+    if (0 == strcmp(format, LOG_LEVEL_OPTION_FORMAT)) {
+        length = snprintf(NULL, 0, LOG_LEVEL_OPTION_FORMAT, atoi(value));
+    } else if (0 == strcmp(format, LOG_FILE_OPTION_FORMAT)) {
+        length = snprintf(NULL, 0, LOG_FILE_OPTION_FORMAT, value);
+    }
+    return length;
+}
+
+/**
+ * Format the string into the buffer.
+ * @param[in] buffer The buffer
+ * @param[in] bufferSize The size of the buffer
+ * @param[in] format The format string
+ * @param[in] value The value to include in the format string
+ */
+static void
+formatStringIntoBuffer(const char *buffer, int bufferSize, const char *format, const char *value)
+{
+    if (0 == strcmp(format, LOG_LEVEL_OPTION_FORMAT)) {
+        snprintf((char *)buffer, bufferSize, LOG_LEVEL_OPTION_FORMAT, atoi(value));
+    } else if (0 == strcmp(format, LOG_FILE_OPTION_FORMAT)) {
+        snprintf((char *)buffer, bufferSize, LOG_FILE_OPTION_FORMAT, value);
+    }
+}
+
+/**
+ * Create a command option string based on the input value and format.
+ * @param[in] value The value to include in the option string
+ * @param[in] format The format string for the option
+ * @param[out] error A pointer to an integer for the error code
+ * @return A pointer to the allocated option string if successful, NULL otherwise
+ */
+static const char *
+createCommandOption(const char *value, const char *format, int *error)
+{
+    const char *option = NULL;
+    int length = 0;
+    if (NULL == value) {
+        goto returnCreateCommandOption;
+    }
+    /*
+     * We utilize calculateFormattedStringLength to ensure format is a literal
+     * and avoid the error caused by the -Wformat-nonliteral warning.
+     */
+    length = calculateFormattedStringLength(format, value);
+    if (length < 0) {
+        JLI_ReportErrorMessage(COMMAND_OPTION_LENGTH_CALCULATION_ERROR_MESSAGE, value, format);
+        *error = MEMORY_ALLOCATION_ERROR;
+        goto returnCreateCommandOption;
+    }
+    option = (const char *)JLI_MemAlloc(length + 1);
+    if (NULL == option) {
+        JLI_ReportErrorMessage(COMMAND_OPTION_MEMORY_ALLOCATION_ERROR_MESSAGE, value, format);
+        *error = MEMORY_ALLOCATION_ERROR;
+        goto returnCreateCommandOption;
+    }
+    /*
+     * We utilize formatStringIntoBuffer to ensure format is a literal
+     * and avoid the error caused by the -Wformat-nonliteral warning.
+     */
+    formatStringIntoBuffer(option, length + 1, format, value);
+returnCreateCommandOption:
+    return option;
+}
+
+/**
+ * Free the memory allocated for a command option.
+ * @param[in/out] option A pointer to a pointer to a command option
+ */
+static void
+freeCommandOption(const char **option)
+{
+    if ((NULL != option) && (NULL != *option)) {
+        JLI_MemFree((void *)*option);
+        *(char **)option = NULL;
+   }
+}
+
+/**
+ * Restore the system state from a checkpoint using the CRIU tool.
+ * @param[in] checkpointDirectory The directory containing the checkpoint data
+ * @param[in] logLevel The log level for CRIU logging
+ * @param[in] unprivilegedModeOn Indicates whether the unprivileged mode option is on
+ * @param[in] logFile The log file option for CRIU
+ * @return EXECVP_SUCCESS if the execution of the 'criu restore' command succeeds, error code otherwise
+ */
+static int
+restoreFromCheckpoint(const char *checkpointDirectory, const char *logLevel, jboolean unprivilegedModeOn, const char *logFile)
+{
+    int restoreStatus = EXECVP_SUCCESS;
+    const char *logLevelOption = NULL;
+    int argc = CRIU_RESTORE_MIN_ARGS;
+    const char *logFileOption = NULL;
+    const char *argv[CRIU_RESTORE_MAX_ARGS] = { NULL };
+    argv[0] = CRIU_COMMAND;
+    argv[1] = CRIU_RESTORE_OPTION;
+    argv[2] = CRIU_CHECKPOINT_DIRECTORY_OPTION;
+    argv[3] = checkpointDirectory;
+    if (NULL == logLevel) {
+        argv[4] = CRIU_DEFAULT_LOG_LEVEL_OPTION;
+    } else {
+        logLevelOption = createCommandOption(logLevel, LOG_LEVEL_OPTION_FORMAT, &restoreStatus);
+        if (NULL == logLevelOption) {
+            goto returnRestoreFromCheckpoint;
+        }
+        argv[4] = logLevelOption;
+    }
+    argv[5] = CRIU_SHELL_JOB_OPTION;
+    if (unprivilegedModeOn) {
+        argv[argc++] = CRIU_UNPRIVILEGED_MODE_OPTION;
+    }
+    if (NULL != logFile) {
+        logFileOption = createCommandOption(logFile, LOG_FILE_OPTION_FORMAT, &restoreStatus);
+        if (NULL == logFileOption) {
+            goto freeLogLevelOption;
+        }
+        argv[argc++] = logFileOption;
+    }
+    argv[argc] = NULL;
+    if (EXECVP_ERROR == execvp(argv[0], (char * const *)argv)) {
+        restoreStatus = EXECVP_ERROR;
+    }
+    freeCommandOption(&logFileOption);
+freeLogLevelOption:
+    freeCommandOption(&logLevelOption);
+returnRestoreFromCheckpoint:
+    return restoreStatus;
+}
+
+/**
+ * Handle the restoration of the system state from a checkpoint.
+ * @param[in] argc The number of command line arguments
+ * @param[in] argv The array of command line arguments
+ */
+static void
+handleCRaCRestore(int argc, char **argv)
+{
+    const char *checkpointDirectory = NULL;
+    int error = 0;
+    int parentProcessExitStatus = EXIT_SUCCESS;
+    pid_t childProcessPid = 0;
+    const char *logLevel = NULL;
+    int childProcessExitStatus = EXIT_SUCCESS;
+    jboolean unprivilegedModeOn = JNI_FALSE;
+    const char *logFile = NULL;
+    int childProcessPidStatus = 0;
+    int childProcessPidExitStatus = 0;
+    checkpointDirectory = getCheckpointDirectory(argc, argv, &error);
+    if (OPTION_NAME_NOT_FOUND_ERROR == error) {
+        return;
+    }
+    if (hasGetCommandLineOptionValueFoundError(error)) {
+        JLI_ReportErrorMessage(CHECKPOINT_DIRECTORY_ERROR_MESSAGE, error);
+        parentProcessExitStatus = EXIT_FAILURE;
+        goto exitParentProcessHandleCRaCRestore;
+    }
+    /*
+     * The if block will be invoked by the child process,
+     * and the else block will be invoked by the parent process.
+     */
+    childProcessPid = fork();
+    if (0 == childProcessPid) {
+        logLevel = getLogLevel(argc, argv, &error);
+        if (isCommandLineOptionFoundWithError(error)) {
+            JLI_ReportErrorMessage(LOG_LEVEL_ERROR_MESSAGE, error);
+            childProcessExitStatus = EXIT_FAILURE;
+            goto exitChildProcessHandleCRaCRestore;
+        }
+        unprivilegedModeOn = isUnprivilegedModeOn(argc, argv, &error);
+        if (isCommandLineOptionFoundWithError(error)) {
+            JLI_ReportErrorMessage(UNPRIVILEGED_MODE_ERROR_MESSAGE, error);
+            childProcessExitStatus = EXIT_FAILURE;
+            goto exitChildProcessHandleCRaCRestore;
+        }
+        logFile = getLogFile(argc, argv, &error);
+        if (isCommandLineOptionFoundWithError(error)) {
+            JLI_ReportErrorMessage(LOG_FILE_ERROR_MESSAGE, error);
+            childProcessExitStatus = EXIT_FAILURE;
+            goto exitChildProcessHandleCRaCRestore;
+        }
+        childProcessExitStatus = restoreFromCheckpoint(checkpointDirectory, logLevel, unprivilegedModeOn, logFile);
+exitChildProcessHandleCRaCRestore:
+        exit(childProcessExitStatus);
+    } else {
+        waitpid(childProcessPid, &childProcessPidStatus, WAIT_INDEFINITELY);
+        if (WIFEXITED(childProcessPidStatus)) {
+            childProcessPidExitStatus = WEXITSTATUS(childProcessPidStatus);
+            if (EXIT_SUCCESS != childProcessPidExitStatus) {
+                JLI_ReportErrorMessage(RESTORE_FROM_CHECKPOINT_ERROR_MESSAGE, childProcessPidExitStatus);
+                parentProcessExitStatus = EXIT_FAILURE;
+            }
+        } else {
+            JLI_ReportErrorMessage(RESTORE_CHILD_PROCESS_FAILED_ERROR_MESSAGE);
+            parentProcessExitStatus = EXIT_FAILURE;
+        }
+    }
+exitParentProcessHandleCRaCRestore:
+    exit(parentProcessExitStatus);
+}
+#endif /* defined(J9VM_OPT_CRAC_SUPPORT) */
+
 int
 JavaMain(void* _args)
 {
@@ -553,6 +992,10 @@ JavaMain(void* _args)
     jlong start = 0, end = 0;
 
     RegisterThread();
+
+#if defined(J9VM_OPT_CRAC_SUPPORT)
+    handleCRaCRestore(argc, argv);
+#endif /* defined(J9VM_OPT_CRAC_SUPPORT) */
 
     /* Initialize the virtual machine */
     start = CurrentTimeMicros();
