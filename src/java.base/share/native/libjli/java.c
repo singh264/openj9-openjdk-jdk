@@ -87,6 +87,7 @@
 #define OPTION_VALUE_NOT_FOUND_ERROR 3
 #define OPTION_VALUE_NOT_VALID_ERROR 4
 #define OPTION_VALUE_NOT_EXPECTED_ERROR 5
+#define COMMAND_OPTION_FORMAT_NOT_SUPPORTED_ERROR 6
 #define CRIU_RESTORE_MIN_ARGS 6
 #define CRIU_RESTORE_MAX_ARGS 9
 
@@ -103,6 +104,7 @@
 #define LOG_LEVEL_ERROR_MESSAGE "Failed to get the CRIU log level, error=%d."
 #define UNPRIVILEGED_MODE_ERROR_MESSAGE "Failed to get the CRIU unprivileged mode, error=%d."
 #define LOG_FILE_ERROR_MESSAGE "Failed to get the CRIU log file, error=%d."
+#define COMMAND_OPTION_FORMAT_NOT_SUPPORTED_ERROR_MESSAGE "The format of the command option is unsupported, format=%s."
 #define COMMAND_OPTION_LENGTH_CALCULATION_ERROR_MESSAGE "Failed to calculate the length of the command option, value=%s, format=%s."
 #define COMMAND_OPTION_MEMORY_ALLOCATION_ERROR_MESSAGE "Failed to allocate memory for the command option, value=%s, format=%s."
 #define RESTORE_FROM_CHECKPOINT_ERROR_MESSAGE "Failed to restore from checkpoint, error=%d."
@@ -638,7 +640,7 @@ getCommandLineOptionValue(const char *optionName, int argc, char **argv, int *er
 static jboolean
 hasGetCommandLineOptionValueFoundError(int error)
 {
-    return 0 != error;
+    return (0 != error) ? JNI_TRUE : JNI_FALSE;
 }
 
 /**
@@ -688,10 +690,11 @@ getLogLevel(int argc, char **argv, int *error)
     const char *logLevel = NULL;
     const char *logLevelPropertyValue = NULL;
     int logLevelValue = 0;
+    const char *c = NULL;
     logLevelPropertyValue = getCommandLineOptionValue(LOG_LEVEL_OPTION_NAME, argc, argv, error);
     if (!isCommandLineOptionFoundWithError(*error)) {
         if (NULL != logLevelPropertyValue) {
-            for (const char *c = logLevelPropertyValue; NULL_TERMINATOR != *c; c++) {
+            for (c = logLevelPropertyValue; NULL_TERMINATOR != *c; c++) {
                 if (!isdigit(*c)) {
                     goto setLogLevelOptionValueNotValidError;
                 }
@@ -763,41 +766,6 @@ getLogFile(int argc, char **argv, int *error)
 }
 
 /**
- * Calculate the length of the formatted string.
- * @param[in] format The format string
- * @param[in] value The value to include in the format string
- * @return THe length of the formatted string, -1 otherwise
- */
-static int
-calculateFormattedStringLength(const char *format, const char *value)
-{
-    int length = -1;
-    if (0 == strcmp(format, LOG_LEVEL_OPTION_FORMAT)) {
-        length = snprintf(NULL, 0, LOG_LEVEL_OPTION_FORMAT, atoi(value));
-    } else if (0 == strcmp(format, LOG_FILE_OPTION_FORMAT)) {
-        length = snprintf(NULL, 0, LOG_FILE_OPTION_FORMAT, value);
-    }
-    return length;
-}
-
-/**
- * Format the string into the buffer.
- * @param[in] buffer The buffer
- * @param[in] bufferSize The size of the buffer
- * @param[in] format The format string
- * @param[in] value The value to include in the format string
- */
-static void
-formatStringIntoBuffer(const char *buffer, int bufferSize, const char *format, const char *value)
-{
-    if (0 == strcmp(format, LOG_LEVEL_OPTION_FORMAT)) {
-        snprintf((char *)buffer, bufferSize, LOG_LEVEL_OPTION_FORMAT, atoi(value));
-    } else if (0 == strcmp(format, LOG_FILE_OPTION_FORMAT)) {
-        snprintf((char *)buffer, bufferSize, LOG_FILE_OPTION_FORMAT, value);
-    }
-}
-
-/**
  * Create a command option string based on the input value and format.
  * @param[in] value The value to include in the option string
  * @param[in] format The format string for the option
@@ -807,34 +775,49 @@ formatStringIntoBuffer(const char *buffer, int bufferSize, const char *format, c
 static const char *
 createCommandOption(const char *value, const char *format, int *error)
 {
-    const char *option = NULL;
-    int length = 0;
+    char *option = NULL;
+    int length = -1;
     if (NULL == value) {
         goto returnCreateCommandOption;
     }
     /*
-     * We utilize calculateFormattedStringLength to ensure format is a literal
+     * We utilize the format macros to ensure a literal is passed to snprintf
      * and avoid the error caused by the -Wformat-nonliteral warning.
      */
-    length = calculateFormattedStringLength(format, value);
+    if (0 == strcmp(format, LOG_LEVEL_OPTION_FORMAT)) {
+        length = snprintf(NULL, 0, LOG_LEVEL_OPTION_FORMAT, atoi(value));
+    } else if (0 == strcmp(format, LOG_FILE_OPTION_FORMAT)) {
+        length = snprintf(NULL, 0, LOG_FILE_OPTION_FORMAT, value);
+    } else {
+        JLI_ReportErrorMessage(COMMAND_OPTION_FORMAT_NOT_SUPPORTED_ERROR_MESSAGE, format);
+        *error = COMMAND_OPTION_FORMAT_NOT_SUPPORTED_ERROR;
+        goto returnCreateCommandOption;
+    }
     if (length < 0) {
         JLI_ReportErrorMessage(COMMAND_OPTION_LENGTH_CALCULATION_ERROR_MESSAGE, value, format);
         *error = MEMORY_ALLOCATION_ERROR;
         goto returnCreateCommandOption;
     }
-    option = (const char *)JLI_MemAlloc(length + 1);
+    option = (char *)JLI_MemAlloc(length + 1);
     if (NULL == option) {
         JLI_ReportErrorMessage(COMMAND_OPTION_MEMORY_ALLOCATION_ERROR_MESSAGE, value, format);
         *error = MEMORY_ALLOCATION_ERROR;
         goto returnCreateCommandOption;
     }
     /*
-     * We utilize formatStringIntoBuffer to ensure format is a literal
+     * We utilize the format macros to ensure a literal is passed to snprintf
      * and avoid the error caused by the -Wformat-nonliteral warning.
      */
-    formatStringIntoBuffer(option, length + 1, format, value);
+    if (0 == strcmp(format, LOG_LEVEL_OPTION_FORMAT)) {
+        snprintf(option, length + 1, LOG_LEVEL_OPTION_FORMAT, atoi(value));
+    } else if (0 == strcmp(format, LOG_FILE_OPTION_FORMAT)) {
+        snprintf(option, length + 1, LOG_FILE_OPTION_FORMAT, value);
+    } else {
+        JLI_ReportErrorMessage(COMMAND_OPTION_FORMAT_NOT_SUPPORTED_ERROR_MESSAGE, format);
+        *error = COMMAND_OPTION_FORMAT_NOT_SUPPORTED_ERROR;
+    }
 returnCreateCommandOption:
-    return option;
+    return (const char *)option;
 }
 
 /**
